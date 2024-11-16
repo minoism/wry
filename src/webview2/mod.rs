@@ -6,7 +6,8 @@ mod drag_drop;
 mod util;
 
 use std::{
-  borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, path::PathBuf, rc::Rc, sync::mpsc,
+  borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, fs, path::PathBuf, rc::Rc,
+  sync::mpsc,
 };
 
 use dpi::{PhysicalPosition, PhysicalSize};
@@ -133,7 +134,15 @@ impl InnerWebView {
       is_child,
     )?;
 
-    let drag_drop_controller = drop_handler.map(|handler| DragDropController::new(hwnd, handler));
+    let drag_drop_controller = drop_handler.map(|handler| {
+      // Disable file drops, so our handler can capture it
+      unsafe {
+        let _ = controller
+          .cast::<ICoreWebView2Controller4>()
+          .and_then(|c| c.SetAllowExternalDrop(false));
+      }
+      DragDropController::new(hwnd, handler)
+    });
 
     let w = Self {
       id,
@@ -439,9 +448,13 @@ impl InnerWebView {
       };
     }
 
-    // Initialize scripts
-    for js in attributes.initialization_scripts {
-      Self::add_script_to_execute_on_document_created(&webview, js)?;
+    // Initialize main and subframe scripts
+    for (js, _) in attributes
+      .initialization_scripts
+      .iter()
+      .filter(|(_, for_main)| !*for_main)
+    {
+      Self::add_script_to_execute_on_document_created(&webview, js.clone())?;
     }
 
     // Enable clipboard
@@ -496,6 +509,15 @@ impl InnerWebView {
 
       if attributes.focused {
         controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)?;
+      }
+    }
+
+    // Extension loading
+    if pl_attrs.browser_extensions_enabled {
+      if let Some(extension_path) = pl_attrs.extension_path {
+        unsafe {
+          Self::load_extensions(&webview, &extension_path)?;
+        }
       }
     }
 
@@ -574,11 +596,28 @@ impl InnerWebView {
         token,
       )?;
     }
+    let scripts = attributes.initialization_scripts.clone();
+
+    webview.add_ContentLoading(
+      &ContentLoadingEventHandler::create(Box::new(move |webview, _| {
+        let Some(webview) = webview else {
+          return Ok(());
+        };
+
+        for (script, _) in scripts.iter().filter(|(_, for_main)| *for_main) {
+          Self::execute_script(&webview, script.clone(), |_| ())?;
+        }
+
+        Ok(())
+      })),
+      token,
+    )?;
 
     // Page load handler
     if let Some(on_page_load_handler) = attributes.on_page_load_handler.take() {
       let on_page_load_handler = Rc::new(on_page_load_handler);
       let on_page_load_handler_ = on_page_load_handler.clone();
+
       webview.add_ContentLoading(
         &ContentLoadingEventHandler::create(Box::new(move |webview, _| {
           let Some(webview) = webview else {
@@ -790,7 +829,7 @@ impl InnerWebView {
     attributes: &mut WebViewAttributes,
     token: &mut EventRegistrationToken,
   ) -> Result<()> {
-    for (name, _) in &attributes.custom_protocols {
+    for name in attributes.custom_protocols.keys() {
       // WebView2 supports non-standard protocols only on Windows 10+, so we have to use this workaround
       // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
       let filter = HSTRING::from(format!("{scheme}://{name}.*"));
@@ -1049,8 +1088,36 @@ impl InnerWebView {
           let controller = dwrefdata as *mut ICoreWebView2Controller;
           let mut rect = RECT::default();
           let _ = GetClientRect(hwnd, &mut rect);
-          let width = rect.right - rect.left;
-          let height = rect.bottom - rect.top;
+          let mut width = rect.right - rect.left;
+          let mut height = rect.bottom - rect.top;
+
+          // adjust for borders
+          let mut pt: POINT = unsafe { std::mem::zeroed() };
+          if unsafe { ClientToScreen(hwnd, &mut pt) }.as_bool() {
+            let mut window_rc: RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut window_rc) }.is_ok() {
+              let top_b = pt.y - window_rc.top;
+
+              // this is a hack to check if the window is undecorated
+              // specifically for winit and tao
+              // or any window that uses `WM_NCCALCSIZE` to create undecorated windows
+              //
+              // tao and winit, set the top border to 0 for undecorated
+              // or 1 for undecorated but has shadows
+              //
+              // normal windows should have a top border of around 32 px
+              //
+              // TODO: find a better way to check if a window is decorated or not
+              if top_b <= 1 {
+                let left_b = pt.x - window_rc.left;
+                let right_b = pt.x + width - window_rc.right;
+                let bottom_b = pt.y + height - window_rc.bottom;
+
+                width = width - left_b - right_b;
+                height = height - top_b - bottom_b;
+              }
+            }
+          }
 
           let _ = (*controller).SetBounds(RECT {
             left: 0,
@@ -1130,7 +1197,6 @@ impl InnerWebView {
     );
   }
 
-  // TODO: feature to allow injecting into (specific) subframes
   #[inline]
   fn add_script_to_execute_on_document_created(webview: &ICoreWebView2, js: String) -> Result<()> {
     let webview = webview.clone();
@@ -1173,6 +1239,24 @@ impl InnerWebView {
     let mut pwstr = PWSTR::null();
     unsafe { webview.Source(&mut pwstr)? };
     Ok(take_pwstr(pwstr))
+  }
+
+  #[inline]
+  unsafe fn load_extensions(webview: &ICoreWebView2, extension_path: &PathBuf) -> Result<()> {
+    let profile = webview
+      .cast::<ICoreWebView2_13>()?
+      .Profile()?
+      .cast::<ICoreWebView2Profile7>()?;
+
+    // Iterate over all folders in the extension path
+    for entry in fs::read_dir(extension_path)? {
+      let path = entry?.path();
+      let path_hs = HSTRING::from(path.as_path());
+
+      profile.AddBrowserExtension(&path_hs, None)?;
+    }
+
+    Ok(())
   }
 }
 
@@ -1277,9 +1361,38 @@ impl InnerWebView {
 
   fn resize_to_parent(&self) -> crate::Result<()> {
     let mut rect = RECT::default();
-    unsafe { GetClientRect(*self.parent.borrow(), &mut rect)? };
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
+    let parent = *self.parent.borrow();
+    unsafe { GetClientRect(parent, &mut rect)? };
+    let mut width = rect.right - rect.left;
+    let mut height = rect.bottom - rect.top;
+
+    // adjust for borders
+    let mut pt: POINT = unsafe { std::mem::zeroed() };
+    if unsafe { ClientToScreen(parent, &mut pt) }.as_bool() {
+      let mut window_rc: RECT = unsafe { std::mem::zeroed() };
+      if unsafe { GetWindowRect(parent, &mut window_rc) }.is_ok() {
+        let top_b = pt.y - window_rc.top;
+
+        // this is a hack to check if the window is undecorated
+        // specifically for winit and tao
+        // or any window that uses `WM_NCCALCSIZE` to create undecorated windows
+        //
+        // tao and winit, set the top border to 0 for undecorated
+        // or 1 for undecorated but has shadows
+        //
+        // normal windows should have a top border of around 32 px
+        //
+        // TODO: find a better way to check if a window is decorated or not
+        if top_b <= 1 {
+          let left_b = pt.x - window_rc.left;
+          let right_b = pt.x + width - window_rc.right;
+          let bottom_b = pt.y + height - window_rc.bottom;
+
+          width = width - left_b - right_b;
+          height = height - top_b - bottom_b;
+        }
+      }
+    }
 
     self.set_bounds_inner((width, height).into(), (0, 0).into())
   }
