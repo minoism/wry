@@ -72,12 +72,13 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use std::{
   cell::RefCell,
-  collections::HashSet,
-  ffi::{c_void, CString},
+  collections::HashMap,
+  ffi::{CStr, CString},
   net::Ipv4Addr,
   os::raw::c_char,
   panic::AssertUnwindSafe,
   ptr::{null_mut, NonNull},
+  rc::Rc,
   str::{self, FromStr},
   sync::{Arc, Mutex},
   time::Duration,
@@ -100,7 +101,14 @@ use http::Request;
 use crate::util::Counter;
 
 static COUNTER: Counter = Counter::new();
-static WEBVIEW_IDS: Lazy<Mutex<HashSet<String>>> = Lazy::new(Default::default);
+
+thread_local! {
+  static WEBVIEW_STATE: RefCell<HashMap<String, WebViewState>> = Default::default();
+}
+
+struct WebViewState {
+  pub protocol_ptrs: Vec<Rc<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder)>>,
+}
 
 #[derive(Debug, Default, Copy, Clone)]
 pub struct PrintMargin {
@@ -140,7 +148,6 @@ pub(crate) struct InnerWebView {
   #[allow(dead_code)]
   // We need this the keep the reference count
   ui_delegate: Retained<WryWebViewUIDelegate>,
-  protocol_ptrs: Vec<*mut Box<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder)>>,
   #[cfg(target_os = "macos")]
   // We need this to update the traffic light inset
   parent_view: Option<Retained<WryWebViewParent>>,
@@ -192,10 +199,6 @@ impl InnerWebView {
       .map(|id| id.to_string())
       .unwrap_or_else(|| COUNTER.next().to_string());
 
-    let mut wv_ids = WEBVIEW_IDS.lock().unwrap();
-    wv_ids.insert(webview_id.clone());
-    drop(wv_ids);
-
     // Safety: objc runtime calls are unsafe
     unsafe {
       let config = WKWebViewConfiguration::new(mtm);
@@ -227,12 +230,15 @@ impl InnerWebView {
       for (name, function) in attributes.custom_protocols {
         let url_scheme_handler_cls = url_scheme_handler::create(&name);
         let handler: *mut AnyObject = objc2::msg_send![url_scheme_handler_cls, new];
-        let function = Box::into_raw(Box::new(function));
-        protocol_ptrs.push(function);
+        let protocol_index = protocol_ptrs.len();
+        protocol_ptrs.push(Rc::from(function));
 
-        let ivar = (*handler).class().instance_variable(c"function").unwrap();
-        let ivar_delegate = ivar.load_mut(&mut *handler);
-        *ivar_delegate = function as *mut _ as *mut c_void;
+        let ivar = (*handler)
+          .class()
+          .instance_variable(CStr::from_bytes_with_nul(b"protocol_index\0").unwrap())
+          .unwrap();
+        let ivar_delegate: &mut usize = ivar.load_mut(&mut *handler);
+        *ivar_delegate = protocol_index;
 
         let ivar = (*handler).class().instance_variable(c"webview_id").unwrap();
         let ivar_delegate: &mut *mut c_char = ivar.load_mut(&mut *handler);
@@ -248,6 +254,10 @@ impl InnerWebView {
           return Err(Error::UrlSchemeRegisterError(name));
         }
       }
+
+      WEBVIEW_STATE.with_borrow_mut(|wv_ids| {
+        wv_ids.insert(webview_id.clone(), WebViewState { protocol_ptrs });
+      });
 
       // WebView and manager
       let manager = config.userContentController();
@@ -509,7 +519,6 @@ impl InnerWebView {
         navigation_policy_delegate,
         download_delegate,
         ui_delegate,
-        protocol_ptrs,
         is_child,
         #[cfg(target_os = "macos")]
         parent_view: None,
@@ -522,8 +531,8 @@ r#"Object.defineProperty(window, 'ipc', {
 });"#,
       true
       );
-      for (js, for_main_only) in attributes.initialization_scripts {
-        w.init(&js, for_main_only);
+      for init_script in attributes.initialization_scripts {
+        w.init(&init_script.script, init_script.for_main_frame_only);
       }
 
       // Set user agent
@@ -1084,7 +1093,7 @@ pub fn platform_webview_version() -> Result<String> {
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
-    WEBVIEW_IDS.lock().unwrap().remove(&self.id);
+    WEBVIEW_STATE.with_borrow_mut(|v| v.remove(&self.id));
 
     // We need to drop handler closures here
     unsafe {
@@ -1097,12 +1106,6 @@ impl Drop for InnerWebView {
           .removeScriptMessageHandlerForName(&ipc);
       }
 
-      for ptr in self.protocol_ptrs.iter() {
-        if !ptr.is_null() {
-          drop(Box::from_raw(*ptr));
-        }
-      }
-
       // Remove webview from window's NSView before dropping.
       self.webview.removeFromSuperview();
       self.webview.retain();
@@ -1113,11 +1116,28 @@ impl Drop for InnerWebView {
 
 /// Converts from wry screen-coordinates to macOS screen-coordinates.
 /// wry: top-left is (0, 0) and y increasing downwards
-/// macOS: bottom-left is (0, 0) and y increasing upwards
+/// macOS:
+///   Default coordinate system: a bottom-left is (0, 0) and y increasing upwards.
+///   Flipped coordinate system: a top-left is (0, 0) and y increasing downwards.
 #[allow(dead_code)]
 unsafe fn window_position(view: &NSView, x: i32, y: i32, height: f64) -> CGPoint {
-  let frame: CGRect = view.frame();
-  CGPoint::new(x as f64, frame.size.height - y as f64 - height)
+  let is_flipped = {
+    #[cfg(target_os = "macos")]
+    {
+      view.isFlipped()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      false
+    }
+  };
+
+  if is_flipped {
+    CGPoint::new(x as f64, y as f64)
+  } else {
+    let frame: CGRect = view.frame();
+    CGPoint::new(x as f64, frame.size.height - y as f64 - height)
+  }
 }
 
 /// Wait synchronously for the NSRunLoop to run until a receiver has a message.
