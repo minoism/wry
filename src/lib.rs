@@ -655,11 +655,7 @@ pub struct WebViewAttributes<'a> {
   ///
   /// Note, that if you do block this behavior, it won't be possible to drop files on `<input type="file">` forms.
   /// Also note, that it's not possible to manually set the value of a `<input type="file">` via JavaScript for security reasons.
-  #[cfg(feature = "drag-drop")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "drag-drop")))]
   pub drag_drop_handler: Option<Box<dyn Fn(DragDropEvent) -> bool>>,
-  #[cfg(not(feature = "drag-drop"))]
-  drag_drop_handler: Option<Box<dyn Fn(DragDropEvent) -> bool>>,
 
   /// A navigation handler to decide if incoming url is allowed to navigate.
   ///
@@ -698,13 +694,8 @@ pub struct WebViewAttributes<'a> {
   ///
   /// The closure take the URL to open and the window features object and returns [`NewWindowResponse`] to determine whether the window should open.
   ///
-  /// ## Platform-specific:
-  ///
-  /// - **Windows**: The closure is executed on a separate thread to prevent a deadlock.
-  ///
   /// [window.open]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
-  pub new_window_req_handler:
-    Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse + Send + Sync>>,
+  pub new_window_req_handler: Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse>>,
 
   /// Enables clipboard access for the page rendered on **Linux** and **Windows**.
   ///
@@ -1167,8 +1158,6 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// Note, that if you do block this behavior, it won't be possible to drop files on `<input type="file">` forms.
   /// Also note, that it's not possible to manually set the value of a `<input type="file">` via JavaScript for security reasons.
-  #[cfg(feature = "drag-drop")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "drag-drop")))]
   pub fn with_drag_drop_handler<F>(mut self, handler: F) -> Self
   where
     F: Fn(DragDropEvent) -> bool + 'static,
@@ -1342,7 +1331,7 @@ impl<'a> WebViewBuilder<'a> {
   /// [window.open]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
   pub fn with_new_window_req_handler(
     mut self,
-    callback: impl Fn(String, NewWindowFeatures) -> NewWindowResponse + Send + Sync + 'static,
+    callback: impl Fn(String, NewWindowFeatures) -> NewWindowResponse + 'static,
   ) -> Self {
     self.attrs.new_window_req_handler = Some(Box::new(callback));
     self
